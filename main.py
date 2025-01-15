@@ -4,30 +4,22 @@ import json
 from collections import defaultdict
 import subprocess
 
-def read_excel_files(folder_path):
+def read_excel_sheets(file_path):
     """
-    指定されたフォルダ内のすべてのExcelファイルを読み込み、データフレームとして統合します。
+    指定されたExcelファイル内のすべてのシートを読み込み、シート名ごとにデータを返します。
 
     Args:
-        folder_path (str): Excelファイルが保存されているフォルダのパス。
+        file_path (str): Excelファイルのパス。
 
     Returns:
-        pd.DataFrame: 統合されたデータフレーム。
+        dict: シート名をキー、データフレームを値とする辞書。
     """
-    data = []
-    for file_name in os.listdir(folder_path):
-        # .xlsx拡張子を持つファイルのみ処理
-        if file_name.endswith(".xlsx"):
-            file_path = os.path.join(folder_path, file_name)
-            # ファイルを読み込み、リストに追加
-            df = pd.read_excel(file_path)
-            data.append(df)
-    # すべてのデータフレームを結合して返す
-    return pd.concat(data, ignore_index=True)
+    # Excelファイル内のすべてのシートを読み込み
+    return pd.read_excel(file_path, sheet_name=None)
 
 def parse_nested_key(resource_dict, keys, value):
     """
-    ネストされたキーを再帰的に処理し、辞書やリスト構造を構築します。
+    再帰的にキーを処理し、辞書やリスト構造を構築します。
 
     Args:
         resource_dict (dict): 対象となるリソース辞書。
@@ -42,7 +34,6 @@ def parse_nested_key(resource_dict, keys, value):
             # 数値の場合はリストのインデックスとして処理
             index = int(key)
             if not isinstance(resource_dict, list):
-                # リストに変換し初期化
                 resource_dict[:] = [{} for _ in range(index + 1)]
             while len(resource_dict) <= index:
                 resource_dict.append({})
@@ -70,44 +61,54 @@ def parse_nested_key(resource_dict, keys, value):
         # 再帰的に次のキーを処理
         parse_nested_key(resource_dict[key], keys[1:], value)
 
-def convert_to_hcl_with_proper_list_formatting(data):
+def convert_book_to_hcl(file_path):
     """
-    データフレームをHCL形式に変換します。リスト内の辞書をHCL形式で整形。
+    Excelファイル全体をHCL形式に変換。最上位階層にブック名、次にシート名をつけて出力。
 
     Args:
-        data (pd.DataFrame): パラメータシートのデータ。
+        file_path (str): Excelファイルのパス。
 
     Returns:
         str: HCL形式の文字列。
     """
-    resources = defaultdict(dict)
+    # ブック名を取得（拡張子を除く）
+    book_name = os.path.splitext(os.path.basename(file_path))[0]
+    # Excelファイルからすべてのシートを読み込む
+    sheets = read_excel_sheets(file_path)
+    book_resources = {}
 
-    for _, row in data.iterrows():
-        # generate_tfvars_flagがFalseの行はスキップ
-        if not row['generate_tfvars_flag']:
-            continue
+    for sheet_name, data in sheets.items():
+        # シートごとにデータを処理
+        resources = defaultdict(dict)
+        for _, row in data.iterrows():
+            # generate_tfvars_flagがFalseの行はスキップ
+            if not row['generate_tfvars_flag']:
+                continue
 
-        resource = row['resource']
-        argument = row['arguments']
-        value = row['value']
+            resource = row['resource']
+            argument = row['arguments']
+            value = row['value']
 
-        # 値を適切な型（intまたはfloat）に変換
-        try:
-            value = int(value)
-        except ValueError:
+            # 値を適切な型（intまたはfloat）に変換
             try:
-                value = float(value)
+                value = int(value)
             except ValueError:
-                pass
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
 
-        # リソースが未定義の場合は初期化
-        if resource not in resources:
-            resources[resource] = {}
+            # リソースが未定義の場合は初期化
+            if resource not in resources:
+                resources[resource] = {}
 
-        # argumentsをドットで分解してキーリストを取得
-        keys = argument.split('.')
-        # 再帰的にネストされた構造を構築
-        parse_nested_key(resources[resource], keys, value)
+            # argumentsをドットで分解してキーリストを取得
+            keys = argument.split('.')
+            # 再帰的にネストされた構造を構築
+            parse_nested_key(resources[resource], keys, value)
+
+        # シート名を最上位階層として保存
+        book_resources[sheet_name] = resources
 
     # HCL形式の出力
     def format_value_as_hcl(value):
@@ -139,18 +140,21 @@ def convert_to_hcl_with_proper_list_formatting(data):
             # 単純な値をJSON形式で出力
             return json.dumps(value)
 
-    # 各リソースをHCL形式で整形
-    hcl_output = ""
-    for resource, attributes in resources.items():
-        hcl_output += f"{resource} = {{\n"
-        for key, value in attributes.items():
-            hcl_output += f"  {key} = {format_value_as_hcl(value)}\n"
-        hcl_output += "}\n\n"
+    hcl_output = f"{book_name} = {{\n"
+    for sheet_name, resources in book_resources.items():
+        hcl_output += f"  {sheet_name} = {{\n"
+        for resource, attributes in resources.items():
+            hcl_output += f"    {resource} = {{\n"
+            for key, value in attributes.items():
+                hcl_output += f"      {key} = {format_value_as_hcl(value)}\n"
+            hcl_output += "    }\n"
+        hcl_output += "  }\n"
+    hcl_output += "}\n"
     return hcl_output
 
-def debug_main_with_hcl_formatting(file_path):
+def debug_main_with_book_and_sheets(file_path):
     """
-    デバッグ用HCL形式整形対応版メイン関数。
+    デバッグ用HCL形式整形対応版メイン関数。ブック名とシート名を最上位階層に追加。
 
     Args:
         file_path (str): Excelファイルのパス。
@@ -165,10 +169,8 @@ def debug_main_with_hcl_formatting(file_path):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    # Excelファイルを読み込み
-    data = pd.read_excel(file_path)
     # HCL形式に変換
-    hcl_output = convert_to_hcl_with_proper_list_formatting(data)
+    hcl_output = convert_book_to_hcl(file_path)
 
     # HCL形式をファイルに出力
     with open(output_file, 'w') as file:
@@ -186,5 +188,5 @@ def debug_main_with_hcl_formatting(file_path):
 # 実行例
 if __name__ == "__main__":
     input_file_path = './parameter/ec2.xlsx'
-    output_file = debug_main_with_hcl_formatting(input_file_path)
+    output_file = debug_main_with_book_and_sheets(input_file_path)
     print(f"HCLファイルが生成されました: {output_file}")
