@@ -1,85 +1,136 @@
 import os
 import pandas as pd
+import json
+from collections import defaultdict
+import subprocess
 
-# "parameter"フォルダ内のすべてのExcelファイルとシートを読み取る関数
-def load_parameters_from_directory(directory):
-    resource_collections = {}
-    for filename in os.listdir(directory):  # フォルダ内のファイルを順に処理
-        if filename.endswith('.xlsx'):  # Excelファイルを判定
-            file_path = os.path.join(directory, filename)
-            workbook_name = os.path.splitext(filename)[0]  # ファイル名を拡張子なしで取得
-            if workbook_name not in resource_collections:
-                resource_collections[workbook_name] = []
+def read_excel_files(folder_path):
+    """
+    指定されたフォルダ内のすべてのExcelファイルを読み込み、データフレームとして統合。
+    """
+    data = []
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith(".xlsx"):
+            file_path = os.path.join(folder_path, file_name)
+            df = pd.read_excel(file_path)
+            data.append(df)
+    return pd.concat(data, ignore_index=True)
 
-            excel_data = pd.ExcelFile(file_path)
-            for sheet_name in excel_data.sheet_names:  # Excelファイル内のすべてのシートを処理
-                data = pd.read_excel(file_path, sheet_name=sheet_name)
-                sheet_data = {}
-                for _, row in data.iterrows():  # 各行のデータを処理
-                    resource = row['resource']  # リソース名を取得
-                    argument = row['arguments']  # 引数名を取得
-                    value = row['value']  # 値を取得
+def parse_nested_key(resource_dict, keys, value):
+    """
+    再帰的にキーを処理し、辞書やリストの構造を構築する。
+    """
+    key = keys[0]
 
-                    # 数値の文字列表現を必要に応じて実際の数値型に変換
-                    try:
-                        value = int(value)
-                    except ValueError:
-                        try:
-                            value = float(value)
-                        except ValueError:
-                            pass  # 数値に変換できない場合はそのまま文字列として扱う
+    if len(keys) == 1:
+        # 最後のキーに値を設定
+        if key.isdigit():
+            index = int(key)
+            if not isinstance(resource_dict, list):
+                resource_dict[:] = [{} for _ in range(index + 1)]
+            while len(resource_dict) <= index:
+                resource_dict.append({})
+            resource_dict[index] = value
+        else:
+            resource_dict[key] = value
+        return
 
-                    # ネストされた引数を処理
-                    keys = argument.split('.')  # ドットで区切られたキーを分割
-                    current = sheet_data.setdefault(resource, {})
-                    for key in keys[:-1]:  # 最後のキー以外でループ
-                        if key not in current:
-                            current[key] = {}
-                        current = current[key]
-                    current[keys[-1]] = value  # 最後のキーに値を設定
+    # 中間キーの処理
+    if key.isdigit():
+        index = int(key)
+        if not isinstance(resource_dict, list):
+            resource_dict[:] = [{} for _ in range(index + 1)]
+        while len(resource_dict) <= index:
+            resource_dict.append({})
+        parse_nested_key(resource_dict[index], keys[1:], value)
+    else:
+        if key not in resource_dict or not isinstance(resource_dict[key], (dict, list)):
+            resource_dict[key] = [] if keys[1].isdigit() else {}
+        parse_nested_key(resource_dict[key], keys[1:], value)
 
-                resource_collections[workbook_name].append({sheet_name: sheet_data})
-    return resource_collections
+def convert_to_hcl_with_proper_list_formatting(data):
+    """
+    データフレームをHCL形式に変換。リスト内の辞書をHCL形式で整形。
+    """
+    resources = defaultdict(dict)
 
-# .tfvarsファイルの内容をフォーマットして生成
-def generate_tfvars_content(resource_collections):
-    lines = []
-    for workbook_name, sheets in resource_collections.items():
-        lines.append(f"{workbook_name} = [")
-        for sheet_data in sheets:
-            for sheet_name, resources in sheet_data.items():
-                lines.append(f"  {sheet_name} = {{")
-                for resource, arguments in resources.items():
-                    lines.append(f"    {resource} = {{")
-                    for key, value in arguments.items():  # 各引数を処理
-                        if isinstance(value, dict):  # ネストされた引数の場合
-                            lines.append(f"      {key} = {{")
-                            for sub_key, sub_value in value.items():  # サブキーを処理
-                                lines.append(f"        {sub_key} = \"{sub_value}\"")
-                            lines.append("      }")
-                        else:  # 単一の引数の場合
-                            lines.append(f"      {key} = \"{value}\"")
-                    lines.append("    }")
-                lines.append("  },")
-        lines.append("]")
-    return "\n".join(lines)
+    for _, row in data.iterrows():
+        if not row['generate_tfvars_flag']:
+            continue
 
-# パラメータファイルを処理するメインスクリプト
-def main():
-    parameter_directory = './parameter'  # パラメータファイルを格納するディレクトリ
-    output_directory = './output_tfvars'  # .tfvarsファイルを保存するディレクトリ
+        resource = row['resource']
+        argument = row['arguments']
+        value = row['value']
 
-    if not os.path.exists(output_directory):  # 出力ディレクトリが存在しない場合は作成
-        os.makedirs(output_directory)
+        # 型変換
+        try:
+            value = int(value)
+        except ValueError:
+            try:
+                value = float(value)
+            except ValueError:
+                pass
 
-    resource_collections = load_parameters_from_directory(parameter_directory)  # パラメータを読み取る
-    tfvars_content = generate_tfvars_content(resource_collections)  # .tfvars内容を生成
+        if resource not in resources:
+            resources[resource] = {}
 
-    output_path = os.path.join(output_directory, 'output.tfvars')  # 出力ファイルのパス
-    with open(output_path, 'w') as f:  # .tfvarsファイルを書き込む
-        f.write(tfvars_content)
+        keys = argument.split('.')
+        parse_nested_key(resources[resource], keys, value)
 
-    print(f".tfvarsファイルが生成されました: {output_path}")
+    # HCL形式の出力
+    def format_value_as_hcl(value):
+        if isinstance(value, list):
+            if all(isinstance(item, dict) for item in value):
+                return "[\n" + ",\n".join(
+                    "    {\n" + "\n".join(
+                        f"      {k} = {json.dumps(v)}" for k, v in item.items()
+                    ) + "\n    }" for item in value
+                ) + "\n  ]"
+            return json.dumps(value)
+        elif isinstance(value, dict):
+            return "{\n" + "\n".join(
+                f"    {k} = {format_value_as_hcl(v)}" for k, v in value.items()
+            ) + "\n  }"
+        else:
+            return json.dumps(value)
 
+    hcl_output = ""
+    for resource, attributes in resources.items():
+        hcl_output += f"{resource} = {{\n"
+        for key, value in attributes.items():
+            hcl_output += f"  {key} = {format_value_as_hcl(value)}\n"
+        hcl_output += "}\n\n"
+    return hcl_output
+
+def debug_main_with_hcl_formatting(file_path):
+    """
+    デバッグ用HCL形式整形対応版メイン関数。
+    """
+    output_folder = './output_tfvars'
+    output_file = os.path.join(output_folder, 'output.tfvars')
+
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # データ読み込み
+    data = pd.read_excel(file_path)
+    hcl_output = convert_to_hcl_with_proper_list_formatting(data)
+
+    # 出力
+    with open(output_file, 'w') as file:
+        file.write(hcl_output)
+
+    try:
+        subprocess.run(['terraform', 'fmt', output_file], check=True)
+        print(f"HCL形式の内容が{output_file}に出力され、フォーマットされました。")
+    except subprocess.CalledProcessError as e:
+        print(f"terraform fmtの実行中にエラーが発生しました: {e}")
+
+    # 結果の確認
+    return output_file
+
+# 実行例
 if __name__ == "__main__":
-    main()
+    input_file_path = './parameter/ec2.xlsx'
+    output_file = debug_main_with_hcl_formatting(input_file_path)
+    print(f"HCLファイルが生成されました: {output_file}")
