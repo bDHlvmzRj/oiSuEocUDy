@@ -1,0 +1,162 @@
+# Terraformモジュール間でセキュリティグループを安全に共有する方法（EC2とALBの例）
+
+## 【はじめに】
+
+Terraformを用いてAWSリソースを確実に構築するためには、モジュール化とリソースの分離が重要です。
+
+その中でも「Security Group(SG)」は複数リソース間で共有されることが多く、適切な共有方法を使わないと、実行時のエラーやサイクル依存の原因となります。
+
+このブログでは、EC2とALBのモジュール間でSGを共有する際の、安全でシンプルなパターンを解説します。AWSやTerraformの公式ドキュメントを引用しつつ、根拠ある設計を提示します。
+
+---
+
+## 【前提】
+
+* EC2はALBからのみ通信を受け付ける
+* ALBとEC2で別のSGを使用
+* Terraformではリソースをmoduleに分離
+
+---
+
+## 【なぜSG共有は難しいのか？】
+
+Terraformでは、`aws_security_group`のIDを他モジュールに渡すには`output`と`variable`を用いる必要があります。これにより明示的な依存関係が生まれ、安全にSGを共有できます。
+
+> 🔗 参考：Terraform 公式モジュール設計ガイド（[Module Composition](https://developer.hashicorp.com/terraform/language/modules/develop/composition)）
+
+また、AWSではSG同士を参照してルールを設定できますが、その際 `source_security_group_id` を使う必要があります。
+
+> 🔗 参考：AWS SG公式ドキュメント（[Security group rules](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_SecurityGroups.html#SecurityGroupRules)）
+
+---
+
+## 【ディレクトリ構成】
+
+```
+modules/
+  ├ security_groups/  # SGを作成
+  ├ ec2/              # EC2を作成
+  └ alb/              # ALBを作成
+```
+
+---
+
+## 【modules/security\_groups/main.tf】
+
+```hcl
+resource "aws_security_group" "web" {
+  name        = "sg-web"
+  description = "Allow HTTP from ALB"
+  vpc_id      = var.vpc_id
+}
+
+resource "aws_security_group_rule" "web_inbound" {
+  type              = "ingress"
+  from_port         = 80
+  to_port           = 80
+  protocol          = "tcp"
+  security_group_id = aws_security_group.web.id
+  source_security_group_id = var.alb_sg_id
+}
+
+output "sg_web_id" {
+  value = aws_security_group.web.id
+}
+```
+
+### ▶ variables.tf
+
+```hcl
+variable "vpc_id" {}
+variable "alb_sg_id" {}
+```
+
+---
+
+## 【modules/alb/main.tf】
+
+```hcl
+resource "aws_security_group" "alb" {
+  name        = "sg-alb"
+  description = "Allow internet access"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+output "sg_alb_id" {
+  value = aws_security_group.alb.id
+}
+```
+
+### ▶ variables.tf
+
+```hcl
+variable "vpc_id" {}
+```
+
+---
+
+## 【modules/ec2/main.tf】
+
+```hcl
+resource "aws_instance" "example" {
+  ami                    = var.ami
+  instance_type          = var.instance_type
+  subnet_id              = var.subnet_id
+  vpc_security_group_ids = [var.sg_web_id]
+}
+```
+
+### ▶ variables.tf
+
+```hcl
+variable "ami" {}
+variable "instance_type" {}
+variable "subnet_id" {}
+variable "sg_web_id" {}
+```
+
+---
+
+## 【親module (main.tf)】
+
+```hcl
+module "alb" {
+  source = "./modules/alb"
+  vpc_id = module.vpc.vpc_id
+}
+
+module "security_groups" {
+  source     = "./modules/security_groups"
+  vpc_id     = module.vpc.vpc_id
+  alb_sg_id  = module.alb.sg_alb_id
+}
+
+module "ec2" {
+  source        = "./modules/ec2"
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+  subnet_id     = module.vpc.public_subnet_id
+  sg_web_id     = module.security_groups.sg_web_id
+}
+```
+
+---
+
+## 【まとめ】
+
+* **SGの生成は一箇所にまとめる**と、次第モジュールが依存を持たずに利用できます
+* **SGのIDはoutputで投げる**のが一番安全（Terraformが依存関係を自動管理）
+* **SGルールは別のresource(aws\_security\_group\_rule)で管理**することでより自由度が高い
+
+Terraformのモジュール間では、リソースの分離だけでなく、その依存関係をどう管理するかが過度な`depends_on`を避けるキーとなります。
+
+> ✅ 補足：Terraformの依存関係解決は、変数やoutputの受け渡しによって自動で行われるため、明示的な`depends_on`を多用する必要は基本的にありません。
+
+> 🔗 参考：Terraform 公式ドキュメント [Resource Dependencies](https://developer.hashicorp.com/terraform/language/resources/behavior#explicit-dependencies)
