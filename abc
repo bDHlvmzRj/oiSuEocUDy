@@ -1,0 +1,124 @@
+OK。`userdata` を **外部の .ps1 ファイル**として読み込む前提で、CPU・メモリ・ディスク空き容量を収集し、EBS 本数が可変でも追随できる構成をまとめます。
+
+---
+
+# 使い方のポイント
+
+* **`user_data = file(".../userdata.ps1")`** なら、ファイル中の `${aws:InstanceId}` は **そのまま**書いてOK（HCLの展開は中身には効きません）。
+* **`user_data = templatefile(".../userdata.ps1.tmpl", {...})`** を使う場合は、テンプレートの `${}` 展開と衝突するので、`${aws:InstanceId}` は **`$${aws:InstanceId}`** にしてください（`$` を二重にする）。
+
+---
+
+# Terraform 側（例）
+
+```hcl
+resource "aws_instance" "win" {
+  ami                    = var.windows_ami_id
+  instance_type          = "t3.micro"
+  subnet_id              = var.subnet_id
+  vpc_security_group_ids = [var.sg_id]
+  iam_instance_profile   = aws_iam_instance_profile.cw_agent_profile.name
+
+  # 外部PS1をそのまま読み込むパターン
+  user_data = file("${path.module}/userdata.ps1")
+}
+```
+
+> ※ `user_data_base64` を使う場合は `base64encode(file(".../userdata.ps1"))` でもOK。
+
+---
+
+# `userdata.ps1`（外部ファイルの中身）
+
+> 純粋な PowerShell スクリプトとして扱わせるため、先頭に **`#ps1_sysnative`** を付けています（64bit PowerShell で実行）。
+> ここでは **起動時に接続中のローカル固定ディスク（＝EBS のドライブ）を自動列挙**し、CloudWatch Agent の `resources` に反映します。
+> Agent の設定 JSON 内の `InstanceId` は **`${aws:InstanceId}`** とそのまま記述してOK（`file()`読込ならエスケープ不要）。
+
+```powershell
+#ps1_sysnative
+$ErrorActionPreference = "Stop"
+
+# ---- 1) CloudWatch Agent をインストール（MSI） ----
+$Msi = "$env:TEMP\amazon-cloudwatch-agent.msi"
+Invoke-WebRequest -UseBasicParsing `
+  -Uri "https://s3.amazonaws.com/amazoncloudwatch-agent/windows/amd64/latest/amazon-cloudwatch-agent.msi" `
+  -OutFile $Msi
+Start-Process msiexec.exe -ArgumentList "/i `"$Msi`" /qn" -Wait
+
+# ---- 2) 監視対象ディスクを動的に列挙（固定ディスクのみ）----
+# DriveType 3 = Local Disk（EBSは通常これ）
+$driveLetters = (Get-CimInstance Win32_LogicalDisk |
+  Where-Object { $_.DriveType -eq 3 } |
+  Select-Object -ExpandProperty DeviceID)
+
+# もし「全部まとめてで良い」ならワイルドカードに切替可：
+# $driveLetters = @("*")
+
+# ---- 3) CloudWatch Agent 設定JSONを生成 ----
+$cfgObj = @{
+  agent   = @{ metrics_collection_interval = 60; debug = $false }
+  metrics = @{
+    append_dimensions     = @{ InstanceId = '${aws:InstanceId}' }  # ← ここはそのままでOK
+    aggregation_dimensions = @(@('InstanceId'))
+    metrics_collected     = @{
+      Processor = @{
+        resources = @('*'); total = $true
+        measurement = @('% Processor Time')
+        metrics_collection_interval = 60
+      }
+      Memory = @{
+        measurement = @('% Committed Bytes In Use')
+        metrics_collection_interval = 60
+      }
+      LogicalDisk = @{
+        resources = $driveLetters
+        measurement = @(
+          @{ name = '% Free Space';  rename = 'FreeStorageSpaceInPercent'; unit = 'Percent'   },
+          @{ name = 'Free Megabytes'; rename = 'FreeStorageSpaceInMB';     unit = 'Megabytes' }
+        )
+        ignore_file_system_types = @('CD-ROM','Remote Disk','Network','Unknown')
+        metrics_collection_interval = 60
+      }
+    }
+  }
+}
+
+$configJson = $cfgObj | ConvertTo-Json -Depth 8
+$configPath = "C:\ProgramData\Amazon\AmazonCloudWatchAgent\config.json"
+New-Item -ItemType Directory -Path (Split-Path $configPath) -Force | Out-Null
+Set-Content -Path $configPath -Value $configJson -Encoding ASCII
+
+# ---- 4) Agent を設定反映して起動 ----
+$ctl = "C:\Program Files\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent-ctl.ps1"
+& $ctl -a stop | Out-Null
+& $ctl -a fetch-config -m ec2 -c file:$configPath -s
+```
+
+### 補足
+
+* **完全自動追随**なら、`$driveLetters = @("*")` にすれば、増減を含め「見える全ドライブ」を常に収集します。
+  厳密に固定ディスクだけ／一部除外したい場合は今の `DriveType -eq 3` のままが実務的です。
+* Agent が付与するメトリクスは CWAgent 名前空間。
+
+  * CPU: `Processor | % Processor Time (total)`
+  * メモリ: `Memory | % Committed Bytes In Use`
+  * ディスク: `LogicalDisk | FreeStorageSpaceInPercent`, `FreeStorageSpaceInMB`
+  * 「**ディスク使用率(%)**」はダッシュボード/アラームで `100 - FreeStorageSpaceInPercent` の **Metric Math** が定番です。
+* 必要な IAM（最小）：`cloudwatch:PutMetricData`。ログ送信もするなら `logs:*` も付与してください。
+
+---
+
+# `templatefile` を使いたい場合の注意（参考）
+
+```hcl
+# 例：メトリクス間隔などを可変化したい場合
+user_data = templatefile("${path.module}/userdata.ps1.tmpl", {
+  metrics_interval = 60
+})
+```
+
+テンプレート内では `${aws:InstanceId}` を **`$${aws:InstanceId}`** と書いてください（テンプレートの `${}` と衝突するため）。
+
+---
+
+必要なら、このまま使える **CloudWatch アラーム（CPU高負荷 / メモリ高 / ディスク使用率高）** の Terraform も併せて作ります。
